@@ -158,6 +158,26 @@ class SettlementList(BaseModel):
     count: int
 
 
+class SettlementEvent(BaseModel):
+    """变更流事件：cursor 单调递增，顺序即数据库提交顺序。"""
+
+    cursor: int
+    event_type: Literal["published", "invalidated"]
+    settlement_no: str
+    meter_id: str
+    start_hour: str
+    end_hour: str
+    hours: int
+    occurred_at: str
+
+
+class SettlementEventPage(BaseModel):
+    events: list[SettlementEvent]
+    count: int
+    next_cursor: int
+    has_more: bool
+
+
 class PublishProblem(BaseModel):
     code: Literal["missing_reading", "hourly_usage_exceeds_limit"]
     start_hour: str

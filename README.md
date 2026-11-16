@@ -39,6 +39,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/meters/{meter_id}/settlements` | 按表列结算摘要 |
 | GET | `/settlements` | 全部结算摘要 |
 | GET | `/settlements/{settlement_no}` | 结算明细（发布时快照） |
+| GET | `/settlement-events` | 结算变更流（递增游标分页，供数仓增量接入） |
 | GET | `/healthz` | 健康检查 |
 
 交互式文档里可直接试调所有接口。
@@ -109,6 +110,60 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 成功返回 201，包含结算号、总用量和每个区间的起止读数及其修订号。
 - 结算明细作为快照落库：之后补录/更正/重新发布都不改变已发布结算号的内容。
 
+### 结算变更流（数仓增量接入）
+
+```
+GET /settlement-events?after=0&limit=100
+```
+
+```json
+{
+  "events": [
+    {
+      "cursor": 1,
+      "event_type": "published",
+      "settlement_no": "STL-20261116T000000Z-…",
+      "meter_id": "M-001",
+      "start_hour": "2026-11-16T00:00:00Z",
+      "end_hour": "2026-11-16T02:00:00Z",
+      "hours": 2,
+      "occurred_at": "2026-11-16T08:00:00.000Z"
+    }
+  ],
+  "count": 1,
+  "next_cursor": 1,
+  "has_more": false
+}
+```
+
+事件类型与产生时机：
+
+| 事件 | 时机 |
+| --- | --- |
+| `published` | 新结算发布成功，与结算数据同一事务落库 |
+| `invalidated` | 更高修订读数入库时，对**引用该时刻旧修订**的每个生效结算记一次；同值高修订同样使旧依据失效 |
+
+消费规则与语义保证：
+
+- 每个事件带递增游标 `cursor`；事件按数据库提交顺序返回（写入在 SQLite 写锁内串行，游标顺序即提交顺序）。
+- 消费方持久化已处理的 `next_cursor`，下次用 `after=next_cursor` 继续；重试、重启后从已存游标恢复即可**不重不漏**。
+- 同版同值重传是幂等操作，不产生任何事件；同一批次更正同一结算的多个边界，只记一次 `invalidated`；已撤下的结算不会被重复失效。
+- 事件与业务写入同一事务提交或回滚：录入/发布失败不会出现可读取的事件。
+- `invalidated` 只撤下变更流中的结算，不删除数据：原结算号仍可查冻结明细，重新发布会得到新结算号和新的 `published` 事件。
+- 变更流仅覆盖功能启用后发布的结算；启用前的历史结算不产生事件，也不会被失效。
+
+消费循环示例：
+
+```bash
+AFTER=0
+while true; do
+  PAGE=$(curl -s "$BASE/settlement-events?after=$AFTER&limit=100")
+  # …处理 PAGE.events（published 拉取明细入库，invalidated 撤下旧结算）…
+  AFTER=$(echo "$PAGE" | jq '.next_cursor')
+  [ "$(echo "$PAGE" | jq '.has_more')" = "true" ] || break
+done
+```
+
 失败响应示例：
 
 ```json
@@ -168,6 +223,7 @@ curl -s $BASE/settlements
 - 录入和发布都在单个 SQLite `BEGIN IMMEDIATE` 事务中完成：谁先取得写锁，谁先被裁决；后到者读到前者已提交的状态。
 - 录入的版本校验与写入在同一事务内，不会出现“都校验通过、都写入”的同版双写。
 - 发布在同一写锁内读取读数、校验、写结算头与明细；中途失败整体回滚，不会留下可查询的半份结算。
+- 变更流事件与对应业务写入在同一事务内提交：任一失败整体回滚，不会出现“业务成功但事件丢失”或“业务失败但事件可读”。
 - 读接口使用独立读事务，看到的是完整提交状态。
 - SQLite 使用 WAL 模式与 30 秒 busy timeout；适用于单机本地部署，不支持多主机共享同一数据库文件。
 
@@ -180,4 +236,4 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-覆盖：UTC 整点/取值边界、幂等重传、旧版与同版异值整批回滚、批内同时刻冲突、回卷、500 上限边界、缺读数区间合并、发布快照不变性、发布失败无残留、以及多线程并发录入/发布与 HTTP 层并发一致性。
+覆盖：UTC 整点/取值边界、幂等重传、旧版与同版异值整批回滚、批内同时刻冲突、回卷、500 上限边界、缺读数区间合并、发布快照不变性、发布失败无残留、多线程并发录入/发布与 HTTP 层并发一致性，以及变更流的发布/失效事件、同批多边界去重、游标分页不重不漏、失败无事件、重启后游标延续和并发不变量。

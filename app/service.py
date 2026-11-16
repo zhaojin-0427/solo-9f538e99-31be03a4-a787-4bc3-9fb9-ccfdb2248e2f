@@ -21,6 +21,8 @@ from .models import (
     ReadingSnapshot,
     ReadingView,
     SettlementDetail,
+    SettlementEvent,
+    SettlementEventPage,
     SettlementInterval,
     SettlementSummary,
     normalize_utc_hour,
@@ -64,6 +66,62 @@ def utc_now_text() -> str:
 
 def _meter_not_found(meter_id: str) -> ApiError:
     return ApiError(404, "meter_not_found", f"电表 {meter_id!r} 不存在", meter_id=meter_id)
+
+
+def _record_invalidations(
+    conn: sqlite3.Connection,
+    meter_id: str,
+    corrections: list[tuple[str, int]],
+    occurred_at: str,
+) -> None:
+    """为读数更正登记“失效”事件，与业务写入同事务成败。
+
+    corrections 是本次批次中接受了更高修订的 (hour, 旧 revision) 列表。
+    引用该时刻旧修订、且仍在变更流中生效（已发布、未失效）的每个结算
+    记一次 invalidated；同一批次更正多个边界时同一结算只记一次。
+    """
+    affected: dict[str, sqlite3.Row] = {}
+    for hour_text, old_revision in corrections:
+        rows = conn.execute(
+            """
+            SELECT s.settlement_no, s.meter_id, s.start_hour, s.end_hour, s.hours
+            FROM settlement_reading_refs r
+            JOIN settlements s ON s.settlement_no = r.settlement_no
+            WHERE r.meter_id = ? AND r.hour = ? AND r.revision = ?
+              -- 变更流仅覆盖启用后发布（已有 published 事件）的结算
+              AND EXISTS (
+                  SELECT 1 FROM settlement_events e
+                  WHERE e.settlement_no = r.settlement_no
+                    AND e.event_type = 'published'
+              )
+              -- 已撤下的结算不重复失效
+              AND NOT EXISTS (
+                  SELECT 1 FROM settlement_events e
+                  WHERE e.settlement_no = r.settlement_no
+                    AND e.event_type = 'invalidated'
+              )
+            """,
+            (meter_id, hour_text, old_revision),
+        ).fetchall()
+        for row in rows:
+            affected.setdefault(row["settlement_no"], row)
+
+    # 按结算号排序，保证同一批次内事件顺序确定
+    for settlement_no in sorted(affected):
+        row = affected[settlement_no]
+        conn.execute(
+            "INSERT INTO settlement_events "
+            "(event_type, settlement_no, meter_id, start_hour, end_hour, hours, occurred_at) "
+            "VALUES ('invalidated', ?, ?, ?, ?, ?, ?)",
+            (
+                settlement_no,
+                row["meter_id"],
+                row["start_hour"],
+                row["end_hour"],
+                row["hours"],
+                occurred_at,
+            ),
+        )
 
 
 def _meter_view(row: sqlite3.Row) -> MeterView:
@@ -211,6 +269,7 @@ def ingest_readings(
 
         received_at = utc_now_text()
         results: list[IngestItemResult] = []
+        corrections: list[tuple[str, int]] = []
         accepted = 0
         unchanged = 0
         for hour_text, items in grouped.items():
@@ -225,16 +284,18 @@ def ingest_readings(
                 status = "accepted"
                 accepted += 1
             elif item.revision == current["revision"]:
-                # 同版同值重传：幂等，不新增版本。
+                # 同版同值重传：幂等，不新增版本，也不产生变更流事件。
                 status = "unchanged"
                 unchanged += 1
             else:
-                # 更高修订：追加新版本，旧版本保留但不再是当前值。
+                # 更高修订：追加新版本，旧版本保留但不再是当前值；
+                # 引用旧修订的结算随之失效（同值高修订同样使旧依据失效）。
                 conn.execute(
                     "INSERT INTO readings (meter_id, hour, revision, value, received_at) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (meter_id, hour_text, item.revision, item.value, received_at),
                 )
+                corrections.append((hour_text, current["revision"]))
                 status = "accepted"
                 accepted += 1
             results.append(
@@ -245,6 +306,9 @@ def ingest_readings(
                     status=status,
                 )
             )
+
+        if corrections:
+            _record_invalidations(conn, meter_id, corrections, received_at)
 
     results.sort(key=lambda r: r.hour)
     return IngestResponse(
@@ -428,6 +492,27 @@ def publish_settlement(
                 for item in intervals
             ],
         )
+        # 固化每个边界整点引用的读数版本，供更正时反查受影响结算。
+        conn.executemany(
+            "INSERT INTO settlement_reading_refs "
+            "(settlement_no, meter_id, hour, revision) VALUES (?, ?, ?, ?)",
+            [
+                (
+                    settlement_no,
+                    meter_id,
+                    boundary_text,
+                    present[boundary_text]["revision"],
+                )
+                for boundary_text in (utc_hour_text(h) for h in required)
+            ],
+        )
+        # 变更流：发布事件，与结算数据同一事务提交。
+        conn.execute(
+            "INSERT INTO settlement_events "
+            "(event_type, settlement_no, meter_id, start_hour, end_hour, hours, occurred_at) "
+            "VALUES ('published', ?, ?, ?, ?, ?, ?)",
+            (settlement_no, meter_id, start_text, end_text, hours, published_at),
+        )
 
     return SettlementDetail(
         settlement_no=settlement_no,
@@ -575,3 +660,43 @@ def list_settlements(
         )
         for row in rows
     ]
+
+
+def list_settlement_events(
+    conn: sqlite3.Connection, after: int, limit: int
+) -> SettlementEventPage:
+    """按游标增量读取变更流。
+
+    event_id 在串行化的写事务内分配，顺序即提交顺序；`WHERE event_id > after
+    ORDER BY event_id` 的键集分页因此不重不漏。多取一条用于判断 has_more。
+    """
+    with read_tx(conn):
+        rows = conn.execute(
+            "SELECT event_id, event_type, settlement_no, meter_id, "
+            "       start_hour, end_hour, hours, occurred_at "
+            "FROM settlement_events WHERE event_id > ? "
+            "ORDER BY event_id LIMIT ?",
+            (after, limit + 1),
+        ).fetchall()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    events = [
+        SettlementEvent(
+            cursor=row["event_id"],
+            event_type=row["event_type"],
+            settlement_no=row["settlement_no"],
+            meter_id=row["meter_id"],
+            start_hour=row["start_hour"],
+            end_hour=row["end_hour"],
+            hours=row["hours"],
+            occurred_at=row["occurred_at"],
+        )
+        for row in rows
+    ]
+    return SettlementEventPage(
+        events=events,
+        count=len(events),
+        next_cursor=events[-1].cursor if events else after,
+        has_more=has_more,
+    )

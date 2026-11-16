@@ -1,7 +1,7 @@
 services:
   energy-api:
     build: .
-    image: park-energy-api:1.0.0
+    image: park-energy-api:1.1.0
     container_name: park-energy-api
     ports:
       - "${API_PORT:-8000}:8000"

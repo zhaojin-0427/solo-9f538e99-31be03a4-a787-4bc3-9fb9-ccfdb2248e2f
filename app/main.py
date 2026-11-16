@@ -24,6 +24,7 @@ from .models import (
     ReadingList,
     SettlementCreate,
     SettlementDetail,
+    SettlementEventPage,
     SettlementList,
     UtcHour,
     validate_meter_id,
@@ -36,6 +37,7 @@ from .service import (
     ingest_readings,
     list_meters,
     list_readings,
+    list_settlement_events,
     list_settlements,
     publish_settlement,
 )
@@ -56,6 +58,13 @@ DESCRIPTION = """
 
 **已发布结算**
 - 结算号查询永远返回发布时的明细和读数修订，后续补录/更正不影响历史结果。
+
+**结算变更流**
+- `GET /settlement-events` 供数仓增量接入：新结算发布记 `published`；
+  更高修订读数入库时，引用该时刻旧修订的每个生效结算记一次 `invalidated`。
+- 事件带结算号、时段和递增游标 `cursor`，按数据库提交顺序返回；
+  用 `after=上一页 next_cursor` 翻页，重试/重启后从已存游标继续即可不重不漏。
+- 事件与业务写入同一事务提交或回滚；变更流仅覆盖功能启用后发布的结算。
 """
 
 
@@ -307,6 +316,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
     )
     def get_settlement_detail(settlement_no: str, conn: Conn) -> SettlementDetail:
         return get_settlement(conn, settlement_no)
+
+    @app.get(
+        "/settlement-events",
+        response_model=SettlementEventPage,
+        tags=["变更流"],
+        summary="结算变更流（按提交顺序的递增游标分页）",
+        responses={
+            200: {
+                "description": "按 cursor 升序返回事件页；用 `after=next_cursor` 取下一页",
+                "content": {"application/json": {"example": {
+                    "events": [{
+                        "cursor": 1,
+                        "event_type": "published",
+                        "settlement_no": "STL-20261116T000000Z-abc123",
+                        "meter_id": "M-001",
+                        "start_hour": "2026-11-16T00:00:00Z",
+                        "end_hour": "2026-11-16T02:00:00Z",
+                        "hours": 2,
+                        "occurred_at": "2026-11-16T08:00:00.000Z",
+                    }],
+                    "count": 1,
+                    "next_cursor": 1,
+                    "has_more": False,
+                }}},
+            },
+        },
+    )
+    def get_events(
+        conn: Conn,
+        after: int = Query(
+            default=0, ge=0,
+            description="游标：只返回 cursor 大于该值的事件；首次从头读取用 0",
+        ),
+        limit: int = Query(default=100, ge=1, le=1000, description="每页最大事件数"),
+    ) -> SettlementEventPage:
+        return list_settlement_events(conn, after, limit)
 
     return app
 

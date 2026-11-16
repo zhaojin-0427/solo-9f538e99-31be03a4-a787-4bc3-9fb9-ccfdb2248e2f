@@ -54,6 +54,35 @@ CREATE TABLE IF NOT EXISTS settlement_intervals (
     end_revision   INTEGER NOT NULL CHECK (end_revision > 0),
     PRIMARY KEY (settlement_no, seq)
 );
+
+-- 发布时固化的读数版本引用：结算在每个边界整点所用的 (hour, revision)。
+-- 读数更正（更高修订入库）时按 (meter_id, hour, 旧 revision) 反查受影响结算。
+CREATE TABLE IF NOT EXISTS settlement_reading_refs (
+    settlement_no TEXT    NOT NULL REFERENCES settlements(settlement_no) ON DELETE CASCADE,
+    meter_id      TEXT    NOT NULL,
+    hour          TEXT    NOT NULL,
+    revision      INTEGER NOT NULL CHECK (revision > 0),
+    PRIMARY KEY (settlement_no, hour)
+);
+
+CREATE INDEX IF NOT EXISTS idx_settlement_reading_refs_lookup
+    ON settlement_reading_refs (meter_id, hour, revision);
+
+-- 结算变更流：event_id 单调递增且只增不复用；写入全部在 BEGIN IMMEDIATE
+-- 写事务内串行完成，因此 event_id 顺序即数据库提交顺序，可作为分页游标。
+CREATE TABLE IF NOT EXISTS settlement_events (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type    TEXT NOT NULL CHECK (event_type IN ('published', 'invalidated')),
+    settlement_no TEXT NOT NULL REFERENCES settlements(settlement_no) ON DELETE RESTRICT,
+    meter_id      TEXT NOT NULL,
+    start_hour    TEXT NOT NULL,
+    end_hour      TEXT NOT NULL,
+    hours         INTEGER NOT NULL,
+    occurred_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_settlement_events_settlement
+    ON settlement_events (settlement_no, event_type);
 """
 
 
